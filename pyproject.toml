@@ -11,6 +11,10 @@ dependencies = [
     "scikit-learn>=1.2.0,<1.7",
     "scipy>=1.11.1,<2",
     "tabpfn>=2.0.6",
+    "matplotlib>=3.9.4",
+    "seaborn>=0.13.2",
+    "hyperopt>=0.2.7",
+    "setuptools>=80.9.0",
 ]
 
 requires-python = ">=3.9"

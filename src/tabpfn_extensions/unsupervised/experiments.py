@@ -119,6 +119,7 @@ class GenerateSyntheticDataExperiment(Experiment):
             
             n_permutations = kwargs.get("n_permutations", 1)
             dag = kwargs.get("dag", None)
+            cpdag = kwargs.get("cpdag", None)
 
             self.X, self.y = X, y
             self.X = self.X[:, indices]
@@ -138,6 +139,7 @@ class GenerateSyntheticDataExperiment(Experiment):
                 t=temp,
                 n_permutations=n_permutations,
                 dag=dag,
+                cpdag=cpdag,
             )
 
             data_real = pd.DataFrame(
@@ -180,6 +182,7 @@ class GenerateSyntheticDataExperiment(Experiment):
             self.data = pd.concat([self.data_real, self.data_synthetic])
 
             self.plot()
+        return {"synthetic_X": self.synthetic_X}
 
 
 class OutlierDetectionUnsupervisedExperiment(Experiment):

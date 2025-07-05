@@ -262,6 +262,108 @@ class TabPFNUnsupervisedModel(BaseEstimator):
 
         return self
 
+    def _parse_cpdag_adjacency_matrix(
+        self,
+        cpdag_adj: np.ndarray,
+    ) -> dict[int, dict[str, list[int]]]:
+        """Parse CPDAG adjacency matrix into dictionary format.
+        
+        Args:
+            cpdag_adj: Adjacency matrix where:
+                      0 = no edge
+                      1 = directed edge (column -> row)
+                      -1 = undirected edge (both directions)
+                      
+        Returns:
+            Dictionary in format {node_idx: {"parents": [parent_indices], "undirected": [undirected_indices]}}
+        """
+        n = cpdag_adj.shape[0]
+        cpdag = {}
+        
+        for i in range(n):
+            # Find causal parents (directed edges pointing to this node)
+            parents = [j for j in range(n) if cpdag_adj[i, j] == 1]
+            
+            # Find undirected neighbors (undirected edges)
+            undirected = []
+            for j in range(n):
+                if (cpdag_adj[i, j] == -1 and cpdag_adj[j, i] == -1 and i != j):
+                    undirected.append(j)
+            
+            cpdag[i] = {"parents": parents, "undirected": undirected}
+            
+        return cpdag
+
+    def _parse_cpdag_and_order_features(
+        self,
+        cpdag: dict[int, dict[str, list[int]]] | np.ndarray | None = None,
+        all_features: list[int] | None = None,
+    ) -> tuple[list[int], dict[int, list[int]], dict[int, str]]:
+        """Parse CPDAG and create hybrid ordering for feature generation.
+        
+        Args:
+            cpdag: Either a dictionary representing a CPDAG with format:
+                   {node_idx: {"parents": [parent_indices], "undirected": [undirected_indices]}}
+                   OR a numpy adjacency matrix where:
+                   0 = no edge, 1 = directed edge (column -> row), -1 = undirected edge
+            all_features: List of all feature indices
+            
+        Returns:
+            tuple containing:
+                - Ordered list of features for generation
+                - Dictionary mapping each feature to its causal parents
+                - Dictionary mapping each feature to its generation strategy ("causal", "mixed", "correlational")
+        """
+        if cpdag is None:
+            return all_features, {}, {}
+        
+        # Convert adjacency matrix to dictionary format if needed
+        if isinstance(cpdag, np.ndarray):
+            cpdag = self._parse_cpdag_adjacency_matrix(cpdag)
+            
+        if all_features is None:
+            all_features = list(range(max(max(cpdag.keys()), max(max(cpdag.values().values())) + 1)))
+            
+        # Fill missing nodes in CPDAG
+        for i in all_features:
+            if i not in cpdag:
+                cpdag[i] = {"parents": [], "undirected": []}
+                
+        # Classify nodes
+        causal_nodes = []
+        correlational_nodes = []
+        
+        for node in all_features:
+            parents = cpdag[node]["parents"]
+            undirected = cpdag[node]["undirected"]
+            
+            if parents:
+                causal_nodes.append(node)
+            else:
+                correlational_nodes.append(node)
+                
+        # Create topological ordering for causal nodes
+        causal_dag = {node: cpdag[node]["parents"] for node in causal_nodes}
+        ts = TopologicalSorter(causal_dag)
+        ordered_causal = list(ts.static_order())
+        
+        # Final ordering: causal -> correlational
+        final_ordering = ordered_causal + correlational_nodes
+        
+        # Create parent mapping
+        parent_mapping = {}
+        strategy_mapping = {}
+        
+        for node in all_features:
+            if node in causal_nodes:
+                parent_mapping[node] = cpdag[node]["parents"]
+                strategy_mapping[node] = "causal"
+            else:  # correlational
+                parent_mapping[node] = []  # Will be filled during generation
+                strategy_mapping[node] = "correlational"
+                
+        return final_ordering, parent_mapping, strategy_mapping
+
     def impute_(
         self,
         X: torch.Tensor,
@@ -269,6 +371,7 @@ class TabPFNUnsupervisedModel(BaseEstimator):
         n_permutations: int = 10,
         condition_on_all_features: bool = True,
         dag: dict[int, list[int]] | None = None,
+        cpdag: dict[int, dict[str, list[int]]] | np.ndarray | None = None,
         fast_mode: bool = False,
     ) -> torch.Tensor:
         """Impute missing values (np.nan) in X by sampling all cells independently from the trained models.
@@ -284,6 +387,9 @@ class TabPFNUnsupervisedModel(BaseEstimator):
                 Whether to condition on all other features (True) or only previous features (False)
             dag: dict[int, list[int]] | None, default=None
                 Dictionary representing a Directed Acyclic Graph (DAG) defining feature dependencies.
+            cpdag: dict[int, dict[str, list[int]]] | None, default=None
+                Dictionary representing a CPDAG with format:
+                {node_idx: {"parents": [parent_indices], "undirected": [undirected_indices]}}
             fast_mode: bool, default=False
                 Whether to use faster settings for testing
 
@@ -296,8 +402,27 @@ class TabPFNUnsupervisedModel(BaseEstimator):
         X_fit = self.X_
         impute_X = copy.deepcopy(X)
         
-        # check if dag is provided
-        if dag is not None:
+        # Handle CPDAG input
+        if cpdag is not None:
+            if dag is not None:
+                raise ValueError("Cannot use both DAG and CPDAG simultaneously.")
+            if condition_on_all_features:
+                raise ValueError(
+                    "CPDAG cannot be used with condition_on_all_features=True."
+                )
+            
+            # Parse CPDAG and get ordering
+            all_features, parent_mapping, strategy_mapping = self._parse_cpdag_and_order_features(
+                cpdag, all_features
+            )
+            
+            # Re-order categorical features accordingly
+            self.categorical_features = [
+                all_features.index(idx) for idx in self.categorical_features
+            ]
+            
+        # Handle DAG input (existing logic)
+        elif dag is not None:
             if condition_on_all_features:
                 raise ValueError(
                     "DAG cannot be used with condition_on_all_features=True."
@@ -317,7 +442,14 @@ class TabPFNUnsupervisedModel(BaseEstimator):
         for i in tqdm(range(len(all_features))):
             column_idx = all_features[i]
 
-            if dag is not None:
+            if cpdag is not None:
+                # Hybrid approach: use causal parents for causal nodes, 
+                # use previous features for correlational nodes
+                if strategy_mapping[column_idx] == "causal":
+                    conditional_idx = parent_mapping[column_idx]
+                else:  # correlational
+                    conditional_idx = all_features[:i] if i > 0 else []
+            elif dag is not None:
                 # If a DAG is provided, use the dependencies from the DAG
                 conditional_idx = dag.get(column_idx, [])
             elif not condition_on_all_features:
@@ -802,6 +934,7 @@ class TabPFNUnsupervisedModel(BaseEstimator):
         t: float = 1.0,
         n_permutations: int = 3,
         dag: dict[int, list[int]] | None = None,
+        cpdag: dict[int, dict[str, list[int]]] | np.ndarray | None = None,
     ) -> torch.Tensor:
         """Generate synthetic tabular data samples using the fitted TabPFN models.
 
@@ -825,6 +958,14 @@ class TabPFNUnsupervisedModel(BaseEstimator):
             dag: dict[int, list[int]] | None, default=None
                 Dictionary representing a Directed Acyclic Graph (DAG) defining feature dependencies.
                 If provided, the generation will respect the dependencies defined in the DAG.
+                
+            cpdag: dict[int, dict[str, list[int]]] | np.ndarray | None, default=None
+                Either a dictionary representing a CPDAG with format:
+                {node_idx: {"parents": [parent_indices], "undirected": [undirected_indices]}}
+                OR a numpy adjacency matrix where:
+                0 = no edge, 1 = directed edge (column -> row), -1 = undirected edge
+                If provided, uses hybrid approach: causal parents for causal/mixed nodes,
+                previous features for correlational nodes.
 
         Returns:
             torch.Tensor:
@@ -859,6 +1000,7 @@ class TabPFNUnsupervisedModel(BaseEstimator):
             n_permutations=actual_n_permutations,
             fast_mode=fast_mode,
             dag=dag,
+            cpdag=cpdag,
         )
 
     def get_embeddings(self, X: torch.tensor, per_column: bool = False) -> torch.tensor:
